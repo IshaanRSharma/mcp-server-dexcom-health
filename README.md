@@ -6,6 +6,7 @@ MCP server for Dexcom CGM glucose data. Enables AI agents to access and analyze 
 
 - **Real-time glucose monitoring** - Current readings with trend analysis
 - **Historical data access** - Up to 24 hours of glucose history
+- **Time window queries** - Query specific time ranges (e.g., "4-3 hours ago")
 - **Clinical analytics** - Time-in-range, GMI, CV%, AGP reports
 - **Episode detection** - Automatic hypo/hyper event identification with detailed context
 - **Time-block analysis** - Identify patterns by time of day
@@ -16,7 +17,7 @@ MCP server for Dexcom CGM glucose data. Enables AI agents to access and analyze 
 | Tool | Description |
 |------|-------------|
 | `get_current_glucose` | Current glucose reading with trend |
-| `get_glucose_readings` | Historical readings (up to 24h) |
+| `get_glucose_readings` | Historical readings with optional time windows |
 | `get_statistics` | TIR, CV%, GMI, and other metrics |
 | `get_status_summary` | Complete "how am I doing?" summary |
 | `detect_episodes` | Find hypo/hyper episodes |
@@ -76,6 +77,28 @@ Add to your `claude_desktop_config.json`:
 
 > "Give me my statistics for the last 12 hours"
 
+> "What about the hour before that?" (follow-up queries work!)
+
+### Time Window Queries
+
+Query specific time ranges using `start_minutes` and `end_minutes`:
+
+```python
+# Last 3 hours (standard)
+get_glucose_readings(minutes=180)
+
+# Specific window: 4 hours ago to 3 hours ago
+get_glucose_readings(start_minutes=240, end_minutes=180)
+
+# Stats for 6-5 hours ago
+get_statistics(start_minutes=360, end_minutes=300)
+
+# Episodes between 8-4 hours ago
+detect_episodes(start_minutes=480, end_minutes=240)
+```
+
+**Supported tools:** `get_glucose_readings`, `get_statistics`, `detect_episodes`, `export_data`
+
 ### Persistence Layer Integration
 
 Tools that analyze data accept an optional `data` parameter for external data sources:
@@ -83,8 +106,8 @@ Tools that analyze data accept an optional `data` parameter for external data so
 # Pass your own historical data
 result = get_statistics(
     data=[
-        {"glucose_mg_dl": 120, "timestamp": "2024-01-15T08:00:00"},
-        {"glucose_mg_dl": 135, "timestamp": "2024-01-15T08:05:00"},
+        {"glucose_mg_dl": 120, "timestamp": "2024-01-15T08:00:00Z"},
+        {"glucose_mg_dl": 135, "timestamp": "2024-01-15T08:05:00Z"},
         # ... more readings
     ]
 )

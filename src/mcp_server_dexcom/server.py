@@ -37,6 +37,22 @@ def parse_external_data(data: list[dict]) -> list:
     
     return [ExternalReading(d["glucose_mg_dl"], d["timestamp"]) for d in data]
 
+
+def _ensure_utc(dt) -> 'datetime':
+    """Ensure a datetime is timezone-aware UTC.
+    
+    pydexcom may return naive datetimes (assumed UTC).
+    This normalizes to timezone-aware UTC for safe comparisons.
+    """
+    from datetime import datetime, timezone
+    
+    if dt.tzinfo is None:
+        # Naive datetime - assume UTC
+        return dt.replace(tzinfo=timezone.utc)
+    else:
+        # Already aware - convert to UTC
+        return dt.astimezone(timezone.utc)
+
 @mcp.tool()
 def get_current_glucose() -> dict:
     """
@@ -66,33 +82,66 @@ def get_current_glucose() -> dict:
 @mcp.tool()
 def get_glucose_readings(
     minutes: int = 60,
-    max_count: int = 12,
+    start_minutes: int | None = None,
+    end_minutes: int | None = None,
+    max_count: int = 288,
     data: list[dict] | None = None
 ) -> dict:
     """
     Get historical glucose readings.
     
     Args:
-        minutes: Number of minutes to look back (1-1440, default 60)
-        max_count: Maximum readings to return (1-288, default 12)
+        minutes: Number of minutes to look back from now (1-1440, default 60)
+        start_minutes: Window start - minutes ago from now (e.g., 240 = 4 hours ago)
+        end_minutes: Window end - minutes ago from now (e.g., 180 = 3 hours ago)
+        max_count: Maximum readings to return (1-288, default 288)
         data: Optional external readings for persistence layer integration.
+    
+    Examples:
+        get_glucose_readings(minutes=60)  # Last hour
+        get_glucose_readings(start_minutes=240, end_minutes=180)  # 4h ago to 3h ago
+        get_glucose_readings(start_minutes=360, end_minutes=300)  # 6h ago to 5h ago
+    
+    Note: When using start_minutes/end_minutes, we fetch from start_minutes back
+    and filter to the window. start_minutes should be > end_minutes (further back in time).
     """
+    from datetime import datetime, timedelta, timezone
+    
     if data:
         readings = parse_external_data(data)
-        # Apply max_count limit
-        readings = sorted(readings, key=lambda r: r.datetime, reverse=True)[:max_count]
+        readings = sorted(readings, key=lambda r: r.datetime, reverse=True)
     else:
-        minutes = max(1, min(1440, minutes))
-        max_count = max(1, min(288, max_count))
+        # Determine how far back to fetch
+        fetch_minutes = start_minutes if start_minutes else minutes
+        fetch_minutes = max(1, min(1440, fetch_minutes))
         client = get_dexcom_client()
-        readings = client.get_glucose_readings(minutes=minutes, max_count=max_count)
+        readings = client.get_glucose_readings(minutes=fetch_minutes, max_count=288)
     
     if not readings:
         return {
             "status": "no_data",
-            "message": f"No readings found",
+            "message": "No readings found",
             "readings": []
         }
+    
+    # Apply time window filter if both start and end are specified
+    if start_minutes is not None and end_minutes is not None:
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=start_minutes)  # Further back (older)
+        window_end = now - timedelta(minutes=end_minutes)      # Closer to now (newer)
+        
+        # Filter readings within the window (normalize to UTC for comparison)
+        readings = [r for r in readings if window_start <= _ensure_utc(r.datetime) <= window_end]
+        
+        if not readings:
+            return {
+                "status": "no_data",
+                "message": f"No readings found between {start_minutes} and {end_minutes} minutes ago",
+                "readings": []
+            }
+    
+    # Apply max_count limit
+    readings = readings[:max_count]
     
     return {
         "count": len(readings),
@@ -111,6 +160,8 @@ def get_glucose_readings(
 @mcp.tool()
 def get_statistics(
     minutes: int = 1440,
+    start_minutes: int | None = None,
+    end_minutes: int | None = None,
     low: int = 70,
     high: int = 180,
     data: list[dict] | None = None
@@ -120,16 +171,32 @@ def get_statistics(
     
     Args:
         minutes: Number of minutes to analyze (1-1440, default 1440 = 24h)
+        start_minutes: Window start - minutes ago from now (e.g., 240 = 4 hours ago)
+        end_minutes: Window end - minutes ago from now (e.g., 180 = 3 hours ago)
         low: Low threshold in mg/dL (default 70)
         high: High threshold in mg/dL (default 180)
         data: Optional external readings for persistence layer integration.
+    
+    Examples:
+        get_statistics(minutes=180)  # Stats for last 3 hours
+        get_statistics(start_minutes=240, end_minutes=180)  # Stats for 4h to 3h ago
     """
+    from datetime import datetime, timedelta, timezone
+    
     if data:
         readings = parse_external_data(data)
     else:
-        minutes = max(1, min(1440, minutes))
+        fetch_minutes = start_minutes if start_minutes else minutes
+        fetch_minutes = max(1, min(1440, fetch_minutes))
         client = get_dexcom_client()
-        readings = client.get_glucose_readings(minutes=minutes, max_count=288)
+        readings = client.get_glucose_readings(minutes=fetch_minutes, max_count=288)
+    
+    # Apply time window filter if specified
+    if readings and start_minutes is not None and end_minutes is not None:
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=start_minutes)
+        window_end = now - timedelta(minutes=end_minutes)
+        readings = [r for r in readings if window_start <= _ensure_utc(r.datetime) <= window_end]
     
     if not readings:
         return {
@@ -289,6 +356,8 @@ def get_status_summary(minutes: int = 180) -> dict:
 @mcp.tool()
 def detect_episodes(
     minutes: int = 1440,
+    start_minutes: int | None = None,
+    end_minutes: int | None = None,
     low: int = 70,
     high: int = 180,
     data: list[dict] | None = None
@@ -298,17 +367,33 @@ def detect_episodes(
     
     Args:
         minutes: Time period if using Dexcom API (1-1440, default 1440 = 24h)
+        start_minutes: Window start - minutes ago from now (e.g., 240 = 4 hours ago)
+        end_minutes: Window end - minutes ago from now (e.g., 180 = 3 hours ago)
         low: Low threshold in mg/dL (default 70)
         high: High threshold in mg/dL (default 180)
         data: Optional external readings for persistence layer integration.
               Schema: [{"glucose_mg_dl": int, "timestamp": "ISO-8601"}, ...]
+    
+    Examples:
+        detect_episodes(minutes=180)  # Episodes in last 3 hours
+        detect_episodes(start_minutes=240, end_minutes=180)  # Episodes 4h to 3h ago
     """
+    from datetime import datetime, timedelta, timezone
+    
     if data:
         readings = parse_external_data(data)
     else:
-        minutes = max(1, min(1440, minutes))
+        fetch_minutes = start_minutes if start_minutes else minutes
+        fetch_minutes = max(1, min(1440, fetch_minutes))
         client = get_dexcom_client()
-        readings = client.get_glucose_readings(minutes=minutes, max_count=288)
+        readings = client.get_glucose_readings(minutes=fetch_minutes, max_count=288)
+    
+    # Apply time window filter if specified
+    if readings and start_minutes is not None and end_minutes is not None:
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=start_minutes)
+        window_end = now - timedelta(minutes=end_minutes)
+        readings = [r for r in readings if window_start <= _ensure_utc(r.datetime) <= window_end]
     
     if not readings:
         return {"status": "no_data", "message": "No readings available"}
@@ -721,6 +806,8 @@ def check_alerts(
 @mcp.tool()
 def export_data(
     minutes: int = 1440,
+    start_minutes: int | None = None,
+    end_minutes: int | None = None,
     format: str = "json",
     data: list[dict] | None = None
 ) -> dict:
@@ -732,15 +819,31 @@ def export_data(
     
     Args:
         minutes: Time period to export (1-1440, default 1440 = 24h)
+        start_minutes: Window start - minutes ago from now (e.g., 240 = 4 hours ago)
+        end_minutes: Window end - minutes ago from now (e.g., 180 = 3 hours ago)
         format: Export format - "json" or "csv" (default "json")
         data: Optional external readings to format/export instead of fetching.
+    
+    Examples:
+        export_data(minutes=180)  # Export last 3 hours
+        export_data(start_minutes=240, end_minutes=180)  # Export 4h to 3h ago
     """
+    from datetime import timedelta, timezone
+    
     if data:
         readings = parse_external_data(data)
     else:
-        minutes = max(1, min(1440, minutes))
+        fetch_minutes = start_minutes if start_minutes else minutes
+        fetch_minutes = max(1, min(1440, fetch_minutes))
         client = get_dexcom_client()
-        readings = client.get_glucose_readings(minutes=minutes, max_count=288)
+        readings = client.get_glucose_readings(minutes=fetch_minutes, max_count=288)
+    
+    # Apply time window filter if specified
+    if readings and start_minutes is not None and end_minutes is not None:
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=start_minutes)
+        window_end = now - timedelta(minutes=end_minutes)
+        readings = [r for r in readings if window_start <= _ensure_utc(r.datetime) <= window_end]
     
     if not readings:
         return {"status": "no_data", "message": "No readings to export"}
